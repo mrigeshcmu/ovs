@@ -468,8 +468,11 @@ unsigned long
 cmap_find_batch(const struct cmap *cmap, unsigned long map,
                 uint32_t hashes[], const struct cmap_node *nodes[])
 {
+    // TODO: Add back comments to this function
     const struct cmap_impl *impl = cmap_get_impl(cmap);
-    unsigned long result = map;
+    unsigned long result = 0;
+    unsigned long found_minis_b1 = 0;
+    unsigned long found_minis_b2 = 0;
     int i;
     uint32_t h1s[sizeof map * CHAR_BIT];
     const struct cmap_bucket *b1s[sizeof map * CHAR_BIT];
@@ -479,78 +482,104 @@ cmap_find_batch(const struct cmap *cmap, unsigned long map,
     const struct mini_bucket *mini_buckets = get_mini_buckets_const(impl);
     uint32_t c1s[sizeof map * CHAR_BIT];
 
-    /* Compute hashes and prefetch 1st buckets. */
+    // TODO: have m1s and m2s contiguous
+    /* Compute hashes and prefetch 1st mini-buckets. */
     ULLONG_FOR_EACH_1(i, map) {
         h1s[i] = rehash(impl, hashes[i]);
-        b1s[i] = &impl->buckets[h1s[i] & impl->mask];
         m1s[i] = &mini_buckets[h1s[i] & impl->mask];
-        OVS_PREFETCH(b1s[i]);
-        // TODO: This extra prefetch will make this function take longer,
-        // which is exactly what we're trying to avoid. Find a way to prevent
-        // this.
         OVS_PREFETCH(m1s[i]);
     }
-    /* Lookups, Round 1. Only look up at the first bucket. */
+
+    /* Mini bucket round 1 */
     ULLONG_FOR_EACH_1(i, map) {
         uint32_t c1;
-        const struct cmap_bucket *b1 = b1s[i];
         const struct mini_bucket *m1 = m1s[i];
-        const struct cmap_node *node;
+        bool found;
 
         do {
             c1 = read_even_counter(m1);
-            node = cmap_find_in_bucket(b1, hashes[i]);
+            found = cmap_find_in_mini_bucket(m1, hashes[i]);
         } while (OVS_UNLIKELY(counter_changed(m1, c1)));
+        c1s[i] = c1;
 
-        if (!node) {
-            /* Not found (yet); Prefetch the 2nd bucket. */
-            b2s[i] = &impl->buckets[other_hash(h1s[i]) & impl->mask];
+        if (found) {
+            b1s[i] = &impl->buckets[h1s[i] & impl->mask];
+            OVS_PREFETCH(b1s[i]);
+            ULLONG_SET1(found_minis_b1, i);
+        } else {
             m2s[i] = &mini_buckets[other_hash(h1s[i]) & impl->mask];
-            OVS_PREFETCH(b2s[i]);
             OVS_PREFETCH(m2s[i]);
-            c1s[i] = c1; /* We may need to check this after Round 2. */
-            continue;
         }
-        /* Found. */
-        ULLONG_SET0(map, i); /* Ignore this on round 2. */
-        OVS_PREFETCH(node);
-        nodes[i] = node;
     }
-    /* Round 2. Look into the 2nd bucket, if needed. */
-    ULLONG_FOR_EACH_1(i, map) {
-        uint32_t c2;
-        const struct cmap_bucket *b2 = b2s[i];
-        const struct mini_bucket *m2 = m2s[i];
+
+    /* Real bucket round 1 */
+    ULLONG_FOR_EACH_1(i, found_minis_b1) {
+        uint32_t c1;
+        const struct mini_bucket *m1 = m1s[i];
+        const struct cmap_bucket *b1 = b1s[i];
         const struct cmap_node *node;
 
         do {
+            c1 = read_counter(m1);
+            node = cmap_find_in_bucket(b1, hashes[i]);
+        } while (OVS_UNLIKELY(counter_changed(m1, c1)));
+        if (node) {
+            OVS_PREFETCH(node);
+            nodes[i] = node;
+            ULLONG_SET1(result, i);
+        } else {
+            m2s[i] = &mini_buckets[other_hash(h1s[i]) & impl->mask];
+            OVS_PREFETCH(m2s[i]);
+        }
+    }
+
+    /* Mini round 2 */
+    ULLONG_FOR_EACH_1(i, map & ~result) {
+        uint32_t c2;
+        const struct mini_bucket *m2 = m2s[i];
+        bool found;
+
+        do {
             c2 = read_even_counter(m2);
-            node = cmap_find_in_bucket(b2, hashes[i]);
+            found = cmap_find_in_mini_bucket(m2, hashes[i]);
         } while (OVS_UNLIKELY(counter_changed(m2, c2)));
 
-        if (!node) {
-            /* Not found, but the node may have been moved from b2 to b1 right
-             * after we finished with b1 earlier.  We just got a clean reading
-             * of the 2nd bucket, so we check the counter of the 1st bucket
-             * only.  However, we need to check both buckets again, as the
-             * entry may be moved again to the 2nd bucket.  Basically, we
-             * need to loop as long as it takes to get stable readings of
-             * both buckets.  cmap_find__() does that, and now that we have
-             * fetched both buckets we can just use it. */
-            if (OVS_UNLIKELY(counter_changed(m1s[i], c1s[i]))) {
-                node = cmap_find__(m1s[i], m2s[i], b1s[i], b2s[i], hashes[i]);
-                if (node) {
-                    goto found;
-                }
+        if (found) {
+            b2s[i] = &impl->buckets[other_hash(h1s[i]) & impl->mask];
+            OVS_PREFETCH(b2s[i]);
+            ULLONG_SET1(found_minis_b2, i);
+        } else if (OVS_UNLIKELY(counter_changed(m1s[i], c1s[i]))) {
+            const struct cmap_node *node = cmap_find(cmap, hashes[i]);
+            if (node) {
+                OVS_PREFETCH(node);
+                nodes[i] = node;
+                ULLONG_SET1(result, i);
             }
-            /* Not found. */
-            ULLONG_SET0(result, i); /* Fix the result. */
-            continue;
         }
-found:
-        OVS_PREFETCH(node);
-        nodes[i] = node;
     }
+
+    /* Real bucket round 2 */
+    ULLONG_FOR_EACH_1(i, found_minis_b2) {
+        uint32_t c2;
+        const struct mini_bucket *m2 = m2s[i];
+        const struct cmap_bucket *b2 = b2s[i];
+        const struct cmap_node *node;
+        ovs_assert(!ULLONG_GET(result, i));
+
+        do {
+            c2 = read_counter(m2);
+            node = cmap_find_in_bucket(b2, hashes[i]);
+        } while (OVS_UNLIKELY(counter_changed(m2, c2)));
+        if (!node && OVS_UNLIKELY(counter_changed(m1s[i], c1s[i]))) {
+            node = cmap_find(cmap, hashes[i]);
+        }
+        if (node) {
+            OVS_PREFETCH(node);
+            nodes[i] = node;
+            ULLONG_SET1(result, i);
+        }
+    }
+
     return result;
 }
 
