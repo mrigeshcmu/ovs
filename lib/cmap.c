@@ -145,11 +145,13 @@ struct cmap_bucket {
 };
 BUILD_ASSERT_DECL(sizeof(struct cmap_bucket) == CACHE_LINE_SIZE);
 
+typedef uint8_t mini_hash_t;
+
 struct mini_bucket {
     // TODO: We probably should place counters elsewhere in its own array, so
     // they can be accessed faster when the mini hashes are not needed.
-    atomic_uint32_t counter;
-    uint32_t mini_hashes[CMAP_K];
+    atomic_uint16_t counter;
+    mini_hash_t mini_hashes[CMAP_K];
 };
 
 /* Default maximum load factor (as a fraction of UINT32_MAX + 1) before
@@ -195,7 +197,7 @@ get_mini_buckets(struct cmap_impl *impl)
     return (struct mini_bucket *)((char *)impl + byte_offset);
 }
 
-static inline uint32_t
+static inline mini_hash_t
 get_mini_hash(uint32_t hash)
 {
     return hash;
@@ -357,7 +359,8 @@ cmap_find_in_bucket(const struct cmap_bucket *bucket, uint32_t hash)
 
 // TODO: rename these functions to better names
 static inline bool
-cmap_find_in_mini_bucket(const struct mini_bucket *bucket, uint32_t mini_hash)
+cmap_find_in_mini_bucket(const struct mini_bucket *bucket,
+                         mini_hash_t mini_hash)
 {
     for (int i = 0; i < CMAP_K; i++) {
         if (bucket->mini_hashes[i] == mini_hash) {
@@ -370,7 +373,7 @@ cmap_find_in_mini_bucket(const struct mini_bucket *bucket, uint32_t mini_hash)
 static inline bool
 cmap_mini_bucket_find(const struct mini_bucket *m1,
                       const struct mini_bucket *m2,
-                      uint32_t mini_hash)
+                      mini_hash_t mini_hash)
 {
     uint32_t c1, c2;
     bool found;
@@ -438,7 +441,7 @@ cmap_find(const struct cmap *cmap, uint32_t hash)
     const struct cmap_impl *impl = cmap_get_impl(cmap);
     uint32_t h1 = rehash(impl, hash);
     uint32_t h2 = other_hash(h1);
-    uint32_t mini_hash = get_mini_hash(hash);
+    mini_hash_t mini_hash = get_mini_hash(hash);
 
     const struct mini_bucket *mini_buckets = get_mini_buckets_const(impl);
     if (!cmap_mini_bucket_find(&mini_buckets[h1 & impl->mask],
@@ -579,7 +582,7 @@ cmap_find_bucket_protected(struct cmap_impl *impl, uint32_t hash, uint32_t h)
 }
 
 static bool
-cmap_find_mini_bucket_protected(struct cmap_impl *impl, uint32_t mini_hash,
+cmap_find_mini_bucket_protected(struct cmap_impl *impl, mini_hash_t mini_hash,
                                 uint32_t h)
 {
     struct mini_bucket *b = &get_mini_buckets(impl)[h & impl->mask];
@@ -602,7 +605,7 @@ cmap_find_protected(const struct cmap *cmap, uint32_t hash)
     struct cmap_impl *impl = cmap_get_impl(cmap);
     uint32_t h1 = rehash(impl, hash);
     uint32_t h2 = other_hash(hash);
-    uint32_t mini_hash = get_mini_hash(hash);
+    mini_hash_t mini_hash = get_mini_hash(hash);
     struct cmap_node *node;
 
     if (!cmap_find_mini_bucket_protected(impl, mini_hash, h1) &&
